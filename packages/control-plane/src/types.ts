@@ -93,7 +93,13 @@ export type ClientMessage =
 // Server → Client messages
 export type ServerMessage =
   | { type: "pong"; timestamp: number }
-  | { type: "subscribed"; sessionId: string; state: SessionState }
+  | {
+      type: "subscribed";
+      sessionId: string;
+      state: SessionState;
+      participantId: string;
+      participant?: { participantId: string; name: string; avatar?: string };
+    }
   | { type: "prompt_queued"; messageId: string; position: number }
   | { type: "sandbox_event"; event: SandboxEvent }
   | { type: "presence_sync"; participants: ParticipantPresence[] }
@@ -202,6 +208,7 @@ export interface SessionState {
 
 // Participant presence
 export interface ParticipantPresence {
+  participantId: string;
   userId: string;
   name: string;
   avatar?: string;
@@ -211,6 +218,7 @@ export interface ParticipantPresence {
 
 // Client info (stored in DO memory)
 export interface ClientInfo {
+  participantId: string;
   userId: string;
   name: string;
   avatar?: string;

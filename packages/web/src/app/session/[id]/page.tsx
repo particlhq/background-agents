@@ -136,6 +136,7 @@ export default function SessionPage() {
     events,
     participants,
     artifacts,
+    currentParticipantId,
     sendPrompt,
     stopExecution,
     sendTyping,
@@ -256,6 +257,7 @@ export default function SessionPage() {
         participants={participants}
         events={events}
         artifacts={artifacts}
+        currentParticipantId={currentParticipantId}
         messagesEndRef={messagesEndRef}
         prompt={prompt}
         isSubmitting={isSubmitting}
@@ -286,6 +288,7 @@ function SessionContent({
   participants,
   events,
   artifacts,
+  currentParticipantId,
   messagesEndRef,
   prompt,
   isSubmitting,
@@ -311,6 +314,7 @@ function SessionContent({
   participants: ReturnType<typeof useSessionSocket>["participants"];
   events: ReturnType<typeof useSessionSocket>["events"];
   artifacts: ReturnType<typeof useSessionSocket>["artifacts"];
+  currentParticipantId: string | null;
   messagesEndRef: React.RefObject<HTMLDivElement | null>;
   prompt: string;
   isSubmitting: boolean;
@@ -414,7 +418,11 @@ function SessionContent({
               group.type === "tool_group" ? (
                 <ToolCallGroup key={group.id} events={group.events} groupId={group.id} />
               ) : (
-                <EventItem key={group.id} event={group.event} />
+                <EventItem
+                  key={group.id}
+                  event={group.event}
+                  currentParticipantId={currentParticipantId}
+                />
               )
             )}
             {isSubmitting && <ThinkingIndicator />}
@@ -650,6 +658,7 @@ function ParticipantsList({
 
 function EventItem({
   event,
+  currentParticipantId,
 }: {
   event: {
     type: string;
@@ -660,23 +669,44 @@ function EventItem({
     error?: string;
     status?: string;
     timestamp: number;
+    author?: {
+      participantId: string;
+      name: string;
+      avatar?: string;
+    };
   };
+  currentParticipantId: string | null;
 }) {
   const time = new Date(event.timestamp * 1000).toLocaleTimeString();
 
   switch (event.type) {
-    case "user_message":
-      // Display user's prompt
+    case "user_message": {
+      // Display user's prompt with correct author attribution
       if (!event.content) return null;
+
+      // Determine if this message is from the current user
+      const isCurrentUser =
+        event.author?.participantId && currentParticipantId
+          ? event.author.participantId === currentParticipantId
+          : !event.author; // Messages without author are assumed to be from current user (local)
+
+      const authorName = isCurrentUser ? "You" : event.author?.name || "Unknown User";
+
       return (
         <div className="bg-blue-50 dark:bg-blue-900/20 rounded-lg p-4 ml-8">
           <div className="flex items-center justify-between mb-2">
-            <span className="text-xs text-blue-600 dark:text-blue-400">You</span>
+            <div className="flex items-center gap-2">
+              {!isCurrentUser && event.author?.avatar && (
+                <img src={event.author.avatar} alt={authorName} className="w-5 h-5 rounded-full" />
+              )}
+              <span className="text-xs text-blue-600 dark:text-blue-400">{authorName}</span>
+            </div>
             <span className="text-xs text-gray-500">{time}</span>
           </div>
           <pre className="whitespace-pre-wrap text-sm">{event.content}</pre>
         </div>
       );
+    }
 
     case "token":
       // Display the model's text response with safe markdown rendering

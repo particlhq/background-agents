@@ -31,6 +31,11 @@ interface SandboxEvent {
   status?: string;
   sha?: string;
   timestamp: number;
+  author?: {
+    participantId: string;
+    name: string;
+    avatar?: string;
+  };
 }
 
 interface SessionState {
@@ -47,6 +52,7 @@ interface SessionState {
 }
 
 interface Participant {
+  participantId: string;
   userId: string;
   name: string;
   avatar?: string;
@@ -64,6 +70,7 @@ interface UseSessionSocketReturn {
   events: SandboxEvent[];
   participants: Participant[];
   artifacts: Artifact[];
+  currentParticipantId: string | null;
   sendPrompt: (content: string, model?: string) => void;
   stopExecution: () => void;
   sendTyping: () => void;
@@ -90,6 +97,12 @@ export function useSessionSocket(sessionId: string): UseSessionSocketReturn {
   const [events, setEvents] = useState<SandboxEvent[]>([]);
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const [currentParticipantId, setCurrentParticipantId] = useState<string | null>(null);
+  const currentParticipantRef = useRef<{
+    participantId: string;
+    name: string;
+    avatar?: string;
+  } | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const reconnectAttempts = useRef(0);
 
@@ -105,6 +118,8 @@ export function useSessionSocket(sessionId: string): UseSessionSocketReturn {
       position?: number;
       status?: string;
       error?: string;
+      participantId?: string;
+      participant?: { participantId: string; name: string; avatar?: string };
     }) => {
       switch (data.type) {
         case "subscribed":
@@ -116,6 +131,14 @@ export function useSessionSocket(sessionId: string): UseSessionSocketReturn {
           pendingTextRef.current = null;
           if (data.state) {
             setSessionState(data.state);
+          }
+          // Store the current user's participant ID and info for author attribution
+          if (data.participantId) {
+            setCurrentParticipantId(data.participantId);
+          }
+          // Initialize participant ref immediately for sendPrompt author attribution
+          if (data.participant) {
+            currentParticipantRef.current = data.participant;
           }
           break;
 
@@ -161,6 +184,22 @@ export function useSessionSocket(sessionId: string): UseSessionSocketReturn {
         case "presence_update":
           if (data.participants) {
             setParticipants(data.participants);
+            // Update current participant info for author attribution
+            setCurrentParticipantId((currentId) => {
+              if (currentId) {
+                const currentParticipant = data.participants!.find(
+                  (p) => p.participantId === currentId
+                );
+                if (currentParticipant) {
+                  currentParticipantRef.current = {
+                    participantId: currentParticipant.participantId,
+                    name: currentParticipant.name,
+                    avatar: currentParticipant.avatar,
+                  };
+                }
+              }
+              return currentId;
+            });
           }
           break;
 
@@ -395,11 +434,12 @@ export function useSessionSocket(sessionId: string): UseSessionSocketReturn {
 
     console.log("Sending prompt:", content, "with model:", model);
 
-    // Add user message to events for display
+    // Add user message to events for display with author info
     const userMessageEvent: SandboxEvent = {
       type: "user_message",
       content,
       timestamp: Date.now() / 1000, // Convert to seconds to match server timestamps
+      author: currentParticipantRef.current || undefined,
     };
     setEvents((prev) => [...prev, userMessageEvent]);
 
@@ -492,6 +532,7 @@ export function useSessionSocket(sessionId: string): UseSessionSocketReturn {
     events,
     participants,
     artifacts,
+    currentParticipantId,
     sendPrompt,
     stopExecution,
     sendTyping,

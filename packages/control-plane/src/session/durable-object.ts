@@ -34,6 +34,22 @@ import type {
 } from "./types";
 
 /**
+ * Message row with joined participant info for author attribution.
+ */
+type MessageWithParticipant = MessageRow & {
+  participant_id: string | null;
+  github_name: string | null;
+  github_login: string | null;
+};
+
+/**
+ * Build GitHub avatar URL from login.
+ */
+function getGitHubAvatarUrl(githubLogin: string | null | undefined): string | undefined {
+  return githubLogin ? `https://github.com/${githubLogin}.png` : undefined;
+}
+
+/**
  * Valid model names for the LLM.
  */
 const VALID_MODELS = [
@@ -907,11 +923,10 @@ export class SessionDO extends DurableObject<Env> {
 
     // Build client info from participant data
     const clientInfo: ClientInfo = {
+      participantId: participant.id,
       userId: participant.user_id,
       name: participant.github_name || participant.github_login || participant.user_id,
-      avatar: participant.github_login
-        ? `https://github.com/${participant.github_login}.png`
-        : undefined,
+      avatar: getGitHubAvatarUrl(participant.github_login),
       status: "active",
       lastSeen: Date.now(),
       clientId: data.clientId,
@@ -947,12 +962,18 @@ export class SessionDO extends DurableObject<Env> {
       )
     );
 
-    // Send session state
+    // Send session state with current participant info
     const state = this.getSessionState();
     this.safeSend(ws, {
       type: "subscribed",
       sessionId: state.id,
       state,
+      participantId: participant.id,
+      participant: {
+        participantId: participant.id,
+        name: participant.github_name || participant.github_login || participant.user_id,
+        avatar: getGitHubAvatarUrl(participant.github_login),
+      },
     } as ServerMessage);
 
     // Send historical events (messages and sandbox events)
@@ -969,11 +990,14 @@ export class SessionDO extends DurableObject<Env> {
    * Send historical events to a newly connected client.
    */
   private sendHistoricalEvents(ws: WebSocket): void {
-    // Get messages (user prompts)
+    // Get messages with participant info (user prompts)
     const messagesResult = this.sql.exec(
-      `SELECT * FROM messages ORDER BY created_at ASC LIMIT 100`
+      `SELECT m.*, p.id as participant_id, p.github_name, p.github_login
+       FROM messages m
+       LEFT JOIN participants p ON m.author_id = p.id
+       ORDER BY m.created_at ASC LIMIT 100`
     );
-    const messages = messagesResult.toArray() as unknown as MessageRow[];
+    const messages = messagesResult.toArray() as unknown as MessageWithParticipant[];
 
     // Get events (tool calls, tokens, etc.)
     const eventsResult = this.sql.exec(`SELECT * FROM events ORDER BY created_at ASC LIMIT 500`);
@@ -983,7 +1007,7 @@ export class SessionDO extends DurableObject<Env> {
     interface HistoryItem {
       type: "message" | "event";
       timestamp: number;
-      data: MessageRow | EventRow;
+      data: MessageWithParticipant | EventRow;
     }
 
     const combined: HistoryItem[] = [
@@ -997,7 +1021,7 @@ export class SessionDO extends DurableObject<Env> {
     // Send in chronological order
     for (const item of combined) {
       if (item.type === "message") {
-        const msg = item.data as MessageRow;
+        const msg = item.data as MessageWithParticipant;
         this.safeSend(ws, {
           type: "sandbox_event",
           event: {
@@ -1005,6 +1029,13 @@ export class SessionDO extends DurableObject<Env> {
             content: msg.content,
             messageId: msg.id,
             timestamp: msg.created_at / 1000, // Convert to seconds
+            author: msg.participant_id
+              ? {
+                  participantId: msg.participant_id,
+                  name: msg.github_name || msg.github_login || "Unknown",
+                  avatar: getGitHubAvatarUrl(msg.github_login),
+                }
+              : undefined,
           },
         });
       } else {
@@ -1058,11 +1089,10 @@ export class SessionDO extends DurableObject<Env> {
           const mapping = mappings[0];
           console.log(`[DO] Recovered client info from DB: wsId=${wsId}, user=${mapping.user_id}`);
           client = {
+            participantId: mapping.participant_id,
             userId: mapping.user_id,
             name: mapping.github_name || mapping.github_login || mapping.user_id,
-            avatar: mapping.github_login
-              ? `https://github.com/${mapping.github_login}.png`
-              : undefined,
+            avatar: getGitHubAvatarUrl(mapping.github_login),
             status: "active",
             lastSeen: Date.now(),
             clientId: mapping.client_id || `client-${Date.now()}`,
@@ -1756,6 +1786,7 @@ export class SessionDO extends DurableObject<Env> {
    */
   private getPresenceList(): ParticipantPresence[] {
     return Array.from(this.clients.values()).map((c) => ({
+      participantId: c.participantId,
       userId: c.userId,
       name: c.name,
       avatar: c.avatar,
