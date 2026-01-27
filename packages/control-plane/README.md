@@ -75,14 +75,6 @@ The control plane provides:
 | `/repos/:owner/:name/metadata` | GET    | Get repo metadata    |
 | `/repos/:owner/:name/metadata` | PUT    | Update repo metadata |
 
-### Authentication
-
-| Endpoint                | Method | Description      |
-| ----------------------- | ------ | ---------------- |
-| `/auth/github`          | GET    | Initiate OAuth   |
-| `/auth/github/callback` | GET    | OAuth callback   |
-| `/auth/me`              | GET    | Get current user |
-
 ### Webhooks
 
 | Endpoint           | Method | Description   |

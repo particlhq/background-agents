@@ -66,8 +66,6 @@ function getSessionStub(env: Env, match: RegExpMatchArray): DurableObjectStub | 
  */
 const PUBLIC_ROUTES: RegExp[] = [
   /^\/health$/,
-  /^\/auth\/github$/,
-  /^\/auth\/github\/callback$/,
   /^\/webhooks\/github$/, // GitHub webhooks use signature verification
 ];
 
@@ -281,23 +279,6 @@ const routes: Route[] = [
     handler: handleGetRepoMetadata,
   },
 
-  // Authentication
-  {
-    method: "GET",
-    pattern: parsePattern("/auth/github"),
-    handler: handleGitHubAuthInit,
-  },
-  {
-    method: "GET",
-    pattern: parsePattern("/auth/github/callback"),
-    handler: handleGitHubAuthCallback,
-  },
-  {
-    method: "GET",
-    pattern: parsePattern("/auth/me"),
-    handler: handleGetCurrentUser,
-  },
-
   // Webhooks
   {
     method: "POST",
@@ -432,9 +413,7 @@ async function handleCreateSession(
   const body = (await request.json()) as CreateSessionRequest & {
     // Optional GitHub token for PR creation (will be encrypted and stored)
     githubToken?: string;
-    // Or use authSessionId from OAuth callback
-    authSessionId?: string;
-    // User info (from auth or provided directly)
+    // User info
     userId?: string;
     githubLogin?: string;
     githubName?: string;
@@ -449,34 +428,14 @@ async function handleCreateSession(
   const repoOwner = body.repoOwner.toLowerCase();
   const repoName = body.repoName.toLowerCase();
 
-  // User info - can come from authSessionId or direct params
-  let userId = body.userId || "anonymous";
-  let githubLogin = body.githubLogin;
-  let githubName = body.githubName;
-  let githubEmail = body.githubEmail;
+  // User info from direct params
+  const userId = body.userId || "anonymous";
+  const githubLogin = body.githubLogin;
+  const githubName = body.githubName;
+  const githubEmail = body.githubEmail;
   let githubTokenEncrypted: string | null = null;
 
-  // If authSessionId provided, retrieve stored auth from OAuth callback
-  if (body.authSessionId) {
-    const authData = (await env.SESSION_INDEX.get(`auth:${body.authSessionId}`, "json")) as {
-      userId: string;
-      githubLogin: string;
-      githubName: string | null;
-      githubEmail: string | null;
-      githubTokenEncrypted: string;
-      expiresAt: number;
-    } | null;
-
-    if (authData && authData.expiresAt > Date.now()) {
-      userId = authData.userId;
-      githubLogin = authData.githubLogin;
-      githubName = authData.githubName || undefined;
-      githubEmail = authData.githubEmail || undefined;
-      githubTokenEncrypted = authData.githubTokenEncrypted;
-    }
-  }
-
-  // If direct GitHub token provided, encrypt it (overrides authSessionId)
+  // If GitHub token provided, encrypt it
   if (body.githubToken && env.TOKEN_ENCRYPTION_KEY) {
     try {
       githubTokenEncrypted = await encryptToken(body.githubToken, env.TOKEN_ENCRYPTION_KEY);
@@ -1101,137 +1060,6 @@ async function handleGetRepoMetadata(
     console.error("Failed to get repo metadata:", e);
     return error("Failed to get metadata", 500);
   }
-}
-
-// Auth handlers
-
-async function handleGitHubAuthInit(
-  request: Request,
-  env: Env,
-  _match: RegExpMatchArray
-): Promise<Response> {
-  const url = new URL(request.url);
-  const redirectUri = url.searchParams.get("redirect_uri") ?? `${url.origin}/auth/github/callback`;
-
-  const state = generateId();
-
-  const authUrl = new URL("https://github.com/login/oauth/authorize");
-  authUrl.searchParams.set("client_id", env.GITHUB_CLIENT_ID);
-  authUrl.searchParams.set("redirect_uri", redirectUri);
-  authUrl.searchParams.set("scope", "read:user user:email repo");
-  authUrl.searchParams.set("state", state);
-
-  return Response.redirect(authUrl.toString(), 302);
-}
-
-async function handleGitHubAuthCallback(
-  request: Request,
-  env: Env,
-  _match: RegExpMatchArray
-): Promise<Response> {
-  const url = new URL(request.url);
-  const code = url.searchParams.get("code");
-  const _state = url.searchParams.get("state");
-
-  if (!code) {
-    return error("Missing authorization code");
-  }
-
-  // Exchange code for token
-  const tokenResponse = await fetch("https://github.com/login/oauth/access_token", {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      client_id: env.GITHUB_CLIENT_ID,
-      client_secret: env.GITHUB_CLIENT_SECRET,
-      code,
-    }),
-  });
-
-  const tokenData = (await tokenResponse.json()) as {
-    access_token?: string;
-    error?: string;
-    error_description?: string;
-  };
-
-  if (tokenData.error) {
-    return error(tokenData.error_description ?? tokenData.error);
-  }
-
-  if (!tokenData.access_token) {
-    return error("No access token received");
-  }
-
-  // Get user info
-  const userResponse = await fetch("https://api.github.com/user", {
-    headers: {
-      Authorization: `Bearer ${tokenData.access_token}`,
-      Accept: "application/vnd.github.v3+json",
-      "User-Agent": "Open-Inspect",
-    },
-  });
-
-  const userData = (await userResponse.json()) as {
-    id: number;
-    login: string;
-    name: string | null;
-    email: string | null;
-    avatar_url: string;
-  };
-
-  // Encrypt the token for storage
-  let encryptedToken: string | null = null;
-  if (env.TOKEN_ENCRYPTION_KEY) {
-    try {
-      encryptedToken = await encryptToken(tokenData.access_token, env.TOKEN_ENCRYPTION_KEY);
-    } catch (e) {
-      console.error("Failed to encrypt token:", e);
-    }
-  }
-
-  // Store the user auth info in KV for session creation
-  const authSessionId = generateId();
-  if (encryptedToken) {
-    await env.SESSION_INDEX.put(
-      `auth:${authSessionId}`,
-      JSON.stringify({
-        userId: userData.id.toString(),
-        githubLogin: userData.login,
-        githubName: userData.name,
-        githubEmail: userData.email,
-        githubTokenEncrypted: encryptedToken,
-        createdAt: Date.now(),
-        // Expire auth sessions after 1 hour
-        expiresAt: Date.now() + 60 * 60 * 1000,
-      }),
-      { expirationTtl: 3600 } // KV entry expires in 1 hour
-    );
-  }
-
-  // Return user info and auth session ID for subsequent requests
-  return json({
-    user: {
-      id: userData.id,
-      login: userData.login,
-      name: userData.name,
-      email: userData.email,
-      avatarUrl: userData.avatar_url,
-    },
-    // Auth session ID that can be used when creating sessions
-    authSessionId: encryptedToken ? authSessionId : undefined,
-  });
-}
-
-async function handleGetCurrentUser(
-  _request: Request,
-  _env: Env,
-  _match: RegExpMatchArray
-): Promise<Response> {
-  // TODO: Implement getting current user from session
-  return error("Not implemented", 501);
 }
 
 // Webhook handlers
