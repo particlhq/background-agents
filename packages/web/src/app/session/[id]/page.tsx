@@ -75,6 +75,7 @@ const MODEL_OPTIONS: { category: string; models: ModelOption[] }[] = [
     models: [
       { id: "claude-haiku-4-5", name: "claude haiku 4.5", description: "Fast and efficient" },
       { id: "claude-sonnet-4-5", name: "claude sonnet 4.5", description: "Balanced performance" },
+      { id: "claude-opus-4-5", name: "claude opus 4.5", description: "Most capable" },
     ],
   },
 ];

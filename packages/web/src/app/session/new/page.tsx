@@ -28,6 +28,7 @@ export default function NewSessionPage() {
   const models = [
     { id: "claude-haiku-4-5", name: "Claude Haiku 4.5", description: "Fast & affordable" },
     { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5", description: "Balanced performance" },
+    { id: "claude-opus-4-5", name: "Claude Opus 4.5", description: "Most capable" },
   ];
 
   useEffect(() => {
