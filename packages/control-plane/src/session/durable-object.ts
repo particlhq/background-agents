@@ -12,8 +12,18 @@ import { initSchema } from "./schema";
 import { generateId, decryptToken, hashToken } from "../auth/crypto";
 import { generateInstallationToken, getGitHubAppConfig } from "../auth/github-app";
 import { createModalClient } from "../sandbox/client";
+import { createModalProvider } from "../sandbox/providers/modal-provider";
+import {
+  SandboxLifecycleManager,
+  DEFAULT_LIFECYCLE_CONFIG,
+  type SandboxStorage,
+  type SandboxBroadcaster,
+  type WebSocketManager,
+  type AlarmScheduler,
+  type IdGenerator,
+} from "../sandbox/lifecycle/manager";
 import { createPullRequest, getRepository } from "../auth/pr";
-import { generateBranchName, generateInternalToken } from "@open-inspect/shared";
+import { generateBranchName } from "@open-inspect/shared";
 import { DEFAULT_MODEL, isValidModel, extractProviderAndModel } from "../utils/models";
 import type {
   Env,
@@ -87,6 +97,8 @@ export class SessionDO extends DurableObject<Env> {
     string,
     { resolve: () => void; reject: (err: Error) => void }
   >();
+  // Lifecycle manager (lazily initialized)
+  private _lifecycleManager: SandboxLifecycleManager | null = null;
 
   // Route table for internal API endpoints
   private readonly routes: InternalRoute[] = [
@@ -132,6 +144,119 @@ export class SessionDO extends DurableObject<Env> {
     this.sql = ctx.storage.sql;
     this.repository = new SessionRepository(this.sql);
     this.clients = new Map();
+  }
+
+  /**
+   * Get the lifecycle manager, creating it lazily if needed.
+   * The manager is created with adapters that delegate to the DO's methods.
+   */
+  private get lifecycleManager(): SandboxLifecycleManager {
+    if (!this._lifecycleManager) {
+      this._lifecycleManager = this.createLifecycleManager();
+    }
+    return this._lifecycleManager;
+  }
+
+  /**
+   * Create the lifecycle manager with all required adapters.
+   */
+  private createLifecycleManager(): SandboxLifecycleManager {
+    // Verify Modal configuration
+    if (!this.env.MODAL_API_SECRET || !this.env.MODAL_WORKSPACE) {
+      throw new Error("MODAL_API_SECRET and MODAL_WORKSPACE are required for lifecycle manager");
+    }
+
+    // Create Modal provider
+    const modalClient = createModalClient(this.env.MODAL_API_SECRET, this.env.MODAL_WORKSPACE);
+    const provider = createModalProvider(modalClient, this.env.MODAL_API_SECRET);
+
+    // Storage adapter
+    const storage: SandboxStorage = {
+      getSandbox: () => this.repository.getSandbox(),
+      getSandboxWithCircuitBreaker: () => this.repository.getSandboxWithCircuitBreaker(),
+      getSession: () => this.repository.getSession(),
+      updateSandboxStatus: (status) => this.updateSandboxStatus(status),
+      updateSandboxForSpawn: (data) => this.repository.updateSandboxForSpawn(data),
+      updateSandboxModalObjectId: (id) => this.repository.updateSandboxModalObjectId(id),
+      updateSandboxSnapshotImageId: (sandboxId, imageId) =>
+        this.repository.updateSandboxSnapshotImageId(sandboxId, imageId),
+      updateSandboxLastActivity: (timestamp) =>
+        this.repository.updateSandboxLastActivity(timestamp),
+      incrementCircuitBreakerFailure: (timestamp) =>
+        this.repository.incrementCircuitBreakerFailure(timestamp),
+      resetCircuitBreaker: () => this.repository.resetCircuitBreaker(),
+    };
+
+    // Broadcaster adapter
+    const broadcaster: SandboxBroadcaster = {
+      broadcast: (message) => this.broadcast(message as ServerMessage),
+    };
+
+    // WebSocket manager adapter
+    const wsManager: WebSocketManager = {
+      getSandboxWebSocket: () => this.getSandboxWebSocket(),
+      closeSandboxWebSocket: (code, reason) => {
+        const ws = this.getSandboxWebSocket();
+        if (ws) {
+          try {
+            ws.close(code, reason);
+          } catch {
+            // Ignore errors closing WebSocket
+          }
+          this.sandboxWs = null;
+        }
+      },
+      sendToSandbox: (message) => {
+        const ws = this.getSandboxWebSocket();
+        return ws ? this.safeSend(ws, message) : false;
+      },
+      getConnectedClientCount: () => {
+        return this.ctx.getWebSockets().filter((ws) => {
+          const tags = this.ctx.getTags(ws);
+          return !tags.includes("sandbox") && ws.readyState === WebSocket.OPEN;
+        }).length;
+      },
+    };
+
+    // Alarm scheduler adapter
+    const alarmScheduler: AlarmScheduler = {
+      scheduleAlarm: async (timestamp) => {
+        await this.ctx.storage.setAlarm(timestamp);
+      },
+    };
+
+    // ID generator adapter
+    const idGenerator: IdGenerator = {
+      generateId: () => generateId(),
+    };
+
+    // Build configuration
+    const controlPlaneUrl =
+      this.env.WORKER_URL ||
+      `https://open-inspect-control-plane.${this.env.CF_ACCOUNT_ID || "workers"}.workers.dev`;
+
+    const { provider: llmProvider, model } = extractProviderAndModel(DEFAULT_MODEL);
+
+    const config = {
+      ...DEFAULT_LIFECYCLE_CONFIG,
+      controlPlaneUrl,
+      provider: llmProvider,
+      model,
+      inactivity: {
+        ...DEFAULT_LIFECYCLE_CONFIG.inactivity,
+        timeoutMs: parseInt(this.env.SANDBOX_INACTIVITY_TIMEOUT_MS || "600000", 10),
+      },
+    };
+
+    return new SandboxLifecycleManager(
+      provider,
+      storage,
+      broadcaster,
+      wsManager,
+      alarmScheduler,
+      idGenerator,
+      config
+    );
   }
 
   /**
@@ -395,378 +520,35 @@ export class SessionDO extends DurableObject<Env> {
   /**
    * Durable Object alarm handler.
    *
-   * Called when a scheduled alarm fires. Used for:
-   * 1. Inactivity monitoring - snapshot and stop after 10 minutes of no activity
-   * 2. Heartbeat monitoring - detect stale sandboxes
-   *
-   * The 10-minute timeout balances cost efficiency with user experience:
-   * - Short enough to avoid wasting resources on abandoned sessions
-   * - Long enough for users to read/think between prompts
-   * - Snapshots preserve all state, so resume is instant
+   * Delegates to the lifecycle manager for inactivity and heartbeat monitoring.
    */
   async alarm(): Promise<void> {
-    console.log("[DO] ===== ALARM FIRED =====");
     this.ensureInitialized();
-
-    const sandbox = this.getSandbox();
-    if (!sandbox) {
-      console.log("[DO] Alarm: no sandbox found");
-      return;
-    }
-
-    console.log(
-      `[DO] Alarm: sandbox status=${sandbox.status}, last_activity=${sandbox.last_activity}, last_heartbeat=${sandbox.last_heartbeat}`
-    );
-
-    // Skip if sandbox is already stopped or failed
-    if (sandbox.status === "stopped" || sandbox.status === "failed" || sandbox.status === "stale") {
-      console.log(`[DO] Alarm: sandbox status is ${sandbox.status}, skipping`);
-      return;
-    }
-
-    const now = Date.now();
-    // Default 10 minutes, can be overridden with SANDBOX_INACTIVITY_TIMEOUT_MS env var for testing
-    const INACTIVITY_TIMEOUT_MS = parseInt(this.env.SANDBOX_INACTIVITY_TIMEOUT_MS || "600000", 10);
-    const HEARTBEAT_TIMEOUT_MS = 90000; // 3x heartbeat interval (30s)
-    console.log(`[DO] Alarm: now=${now}, INACTIVITY_TIMEOUT_MS=${INACTIVITY_TIMEOUT_MS}`);
-
-    // Check heartbeat health first - if stale, stop immediately
-    if (this.handleHeartbeatTimeout(sandbox.last_heartbeat, now, HEARTBEAT_TIMEOUT_MS)) {
-      return;
-    }
-
-    // Check for inactivity - snapshot and stop if no activity for configured time
-    if (sandbox.last_activity && (sandbox.status === "ready" || sandbox.status === "running")) {
-      const inactiveTime = now - sandbox.last_activity;
-      console.log(
-        `[DO] Alarm: inactiveTime=${inactiveTime}ms (${inactiveTime / 1000}s), timeout=${INACTIVITY_TIMEOUT_MS}ms`
-      );
-
-      if (inactiveTime >= INACTIVITY_TIMEOUT_MS) {
-        // Check if any clients are still connected - they may be actively reviewing
-        const connectedClients = this.ctx.getWebSockets().filter((ws) => {
-          const tags = this.ctx.getTags(ws);
-          return !tags.includes("sandbox") && ws.readyState === WebSocket.OPEN;
-        });
-
-        if (connectedClients.length > 0) {
-          console.log(
-            `[DO] Inactivity timeout but ${connectedClients.length} clients connected, extending 5 min`
-          );
-          this.broadcast({
-            type: "sandbox_warning",
-            message:
-              "Sandbox will stop in 5 minutes due to inactivity. Send a message to keep it alive.",
-          });
-          await this.ctx.storage.setAlarm(now + 5 * 60 * 1000);
-          return;
-        }
-
-        console.log(
-          `[DO] Inactivity timeout: ${inactiveTime / 1000}s, triggering snapshot and stop`
-        );
-
-        // IMPORTANT: Set status to "stopped" FIRST to block any reconnection attempts
-        // This prevents race conditions where sandbox reconnects before we finish cleanup
-        this.updateSandboxStatus("stopped");
-        this.broadcast({ type: "sandbox_status", status: "stopped" });
-        console.log("[DO] Status set to stopped, blocking reconnections");
-
-        // Now take the snapshot (modal_object_id is still in DB)
-        await this.triggerSnapshot("inactivity_timeout");
-
-        // Send shutdown command to sandbox and close WebSocket
-        const sandboxWs = this.getSandboxWebSocket();
-        if (sandboxWs) {
-          this.safeSend(sandboxWs, { type: "shutdown" });
-          try {
-            sandboxWs.close(1000, "Inactivity timeout");
-          } catch {
-            // Ignore errors closing WebSocket
-          }
-          this.sandboxWs = null;
-        }
-
-        this.broadcast({
-          type: "sandbox_warning",
-          message: "Sandbox stopped due to inactivity, snapshot saved",
-        });
-        return;
-      }
-
-      // Not yet timed out - schedule next check at remaining time (min 30s)
-      const remainingTime = Math.max(INACTIVITY_TIMEOUT_MS - inactiveTime, 30000);
-      console.log(`[DO] Scheduling next alarm in ${remainingTime / 1000}s`);
-      await this.ctx.storage.setAlarm(now + remainingTime);
-    } else {
-      // No last_activity yet - schedule check in 30s
-      await this.ctx.storage.setAlarm(now + 30000);
-    }
+    await this.lifecycleManager.handleAlarm();
   }
-
-  /**
-   * Handle heartbeat timeout detection and response.
-   * If stale, triggers snapshot, updates status to stale, and broadcasts to clients.
-   *
-   * @returns true if heartbeat timed out (caller should return early), false otherwise
-   */
-  private handleHeartbeatTimeout(
-    lastHeartbeat: number | null,
-    now: number,
-    timeoutMs: number
-  ): boolean {
-    if (!lastHeartbeat) {
-      return false;
-    }
-
-    const heartbeatAge = now - lastHeartbeat;
-    if (heartbeatAge > timeoutMs) {
-      console.log(`[DO] Heartbeat timeout: ${heartbeatAge / 1000}s since last heartbeat`);
-      // Use fire-and-forget so status broadcast isn't delayed by snapshot
-      this.ctx.waitUntil(this.triggerSnapshot("heartbeat_timeout"));
-      this.updateSandboxStatus("stale");
-      this.broadcast({ type: "sandbox_status", status: "stale" });
-      return true;
-    }
-
-    return false;
-  }
-
-  // Note: Heartbeat health is now checked in the main alarm() handler
-  // to avoid alarm conflicts (Durable Objects can only have one alarm at a time)
 
   /**
    * Update the last activity timestamp.
+   * Delegates to the lifecycle manager.
    */
   private updateLastActivity(timestamp: number): void {
-    this.repository.updateSandboxLastActivity(timestamp);
+    this.lifecycleManager.updateLastActivity(timestamp);
   }
 
   /**
    * Schedule the inactivity check alarm.
-   * Called when sandbox becomes ready or when activity occurs.
+   * Delegates to the lifecycle manager.
    */
   private async scheduleInactivityCheck(): Promise<void> {
-    const INACTIVITY_CHECK_MS = parseInt(this.env.SANDBOX_INACTIVITY_TIMEOUT_MS || "600000", 10);
-    const alarmTime = Date.now() + INACTIVITY_CHECK_MS;
-    console.log(
-      `[DO] Scheduling inactivity check in ${INACTIVITY_CHECK_MS / 1000}s (at ${new Date(alarmTime).toISOString()})`
-    );
-    await this.ctx.storage.setAlarm(alarmTime);
-    console.log(`[DO] Alarm scheduled successfully`);
+    await this.lifecycleManager.scheduleInactivityCheck();
   }
 
   /**
    * Trigger a filesystem snapshot of the sandbox.
-   *
-   * Called when:
-   * - Agent execution completes (per Ramp spec)
-   * - Pre-timeout warning (approaching 2-hour Modal limit)
-   * - Heartbeat timeout (sandbox may be unresponsive)
+   * Delegates to the lifecycle manager.
    */
   private async triggerSnapshot(reason: string): Promise<void> {
-    const sandbox = this.getSandbox();
-    const session = this.getSession();
-    if (!sandbox?.modal_object_id || !session) {
-      console.log("[DO] Cannot snapshot: no modal_object_id or session");
-      return;
-    }
-
-    // Don't snapshot if already snapshotting
-    if (sandbox.status === "snapshotting") {
-      console.log("[DO] Already snapshotting, skipping");
-      return;
-    }
-
-    // Track previous status only if we're not in a terminal state
-    // Terminal states (stopped, stale, failed) should not be changed by snapshotting
-    const isTerminalState =
-      sandbox.status === "stopped" || sandbox.status === "stale" || sandbox.status === "failed";
-    const previousStatus = sandbox.status;
-
-    if (!isTerminalState) {
-      this.updateSandboxStatus("snapshotting");
-      this.broadcast({ type: "sandbox_status", status: "snapshotting" });
-    }
-
-    try {
-      // Verify Modal configuration
-      const modalApiSecret = this.env.MODAL_API_SECRET;
-      const modalWorkspace = this.env.MODAL_WORKSPACE;
-      if (!modalApiSecret || !modalWorkspace) {
-        console.error(
-          "[DO] MODAL_API_SECRET or MODAL_WORKSPACE not configured, cannot call Modal API"
-        );
-        this.broadcast({
-          type: "sandbox_warning",
-          message: "Snapshot skipped: Modal configuration missing",
-        });
-        return;
-      }
-
-      // Construct Modal API URL from workspace
-      const modalClient = createModalClient(modalApiSecret, modalWorkspace);
-      const modalApiUrl = modalClient.getSnapshotSandboxUrl();
-
-      console.log(
-        `[DO] Triggering snapshot for sandbox ${sandbox.modal_object_id}, reason: ${reason}`
-      );
-
-      // Generate auth token for Modal API
-      const authToken = await generateInternalToken(modalApiSecret);
-
-      // Call Modal endpoint to take snapshot using Modal's internal object ID
-      const response = await fetch(modalApiUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${authToken}`,
-        },
-        body: JSON.stringify({
-          sandbox_id: sandbox.modal_object_id, // Use Modal's internal object ID
-          session_id: session.session_name || session.id,
-          reason,
-        }),
-      });
-
-      const result = (await response.json()) as {
-        success: boolean;
-        data?: { image_id: string };
-        error?: string;
-      };
-
-      if (result.success && result.data?.image_id) {
-        // Store snapshot image ID for later restoration
-        this.repository.updateSandboxSnapshotImageId(sandbox.id, result.data.image_id);
-        console.log(`[DO] Snapshot saved: ${result.data.image_id}`);
-        this.broadcast({
-          type: "snapshot_saved",
-          imageId: result.data.image_id,
-          reason,
-        });
-      } else {
-        console.error("[DO] Snapshot failed:", result.error);
-      }
-    } catch (error) {
-      console.error("[DO] Snapshot request failed:", error);
-    }
-
-    // Restore previous status if we weren't in a terminal state
-    // Terminal states (stopped, stale, failed) should persist after snapshot
-    if (!isTerminalState && reason !== "heartbeat_timeout") {
-      this.updateSandboxStatus(previousStatus);
-      this.broadcast({ type: "sandbox_status", status: previousStatus });
-    }
-  }
-
-  /**
-   * Restore a sandbox from a filesystem snapshot.
-   *
-   * Called when resuming a session that has a saved snapshot.
-   * Creates a new sandbox from the snapshot Image, skipping git clone.
-   */
-  private async restoreFromSnapshot(snapshotImageId: string): Promise<void> {
-    const session = this.getSession();
-    if (!session) {
-      console.error("[DO] Cannot restore: no session");
-      return;
-    }
-
-    this.updateSandboxStatus("spawning");
-    this.broadcast({ type: "sandbox_status", status: "spawning" });
-
-    try {
-      const now = Date.now();
-      const sandboxAuthToken = generateId();
-      const expectedSandboxId = `sandbox-${session.repo_owner}-${session.repo_name}-${now}`;
-
-      // Store expected sandbox ID and auth token before calling Modal
-      this.repository.updateSandboxForSpawn({
-        status: "spawning",
-        createdAt: now,
-        authToken: sandboxAuthToken,
-        modalSandboxId: expectedSandboxId,
-      });
-
-      // Verify Modal configuration
-      const modalApiSecret = this.env.MODAL_API_SECRET;
-      const modalWorkspace = this.env.MODAL_WORKSPACE;
-      if (!modalApiSecret || !modalWorkspace) {
-        console.error(
-          "[DO] MODAL_API_SECRET or MODAL_WORKSPACE not configured, cannot call Modal API"
-        );
-        this.updateSandboxStatus("failed");
-        this.broadcast({
-          type: "sandbox_error",
-          error: "Modal configuration missing (MODAL_API_SECRET or MODAL_WORKSPACE)",
-        });
-        return;
-      }
-
-      // Construct Modal API URL from workspace
-      const modalClient = createModalClient(modalApiSecret, modalWorkspace);
-      const modalApiUrl = modalClient.getRestoreSandboxUrl();
-
-      // Get control plane URL
-      const controlPlaneUrl =
-        this.env.WORKER_URL ||
-        `https://open-inspect-control-plane.${this.env.CF_ACCOUNT_ID || "workers"}.workers.dev`;
-
-      // Generate auth token for Modal API
-      const authToken = await generateInternalToken(modalApiSecret);
-
-      console.log(`[DO] Restoring sandbox from snapshot ${snapshotImageId}`);
-
-      const response = await fetch(modalApiUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${authToken}`,
-        },
-        body: JSON.stringify({
-          snapshot_image_id: snapshotImageId,
-          session_config: {
-            session_id: session.session_name || session.id,
-            repo_owner: session.repo_owner,
-            repo_name: session.repo_name,
-            ...extractProviderAndModel(session.model || DEFAULT_MODEL),
-          },
-          sandbox_id: expectedSandboxId,
-          control_plane_url: controlPlaneUrl,
-          sandbox_auth_token: sandboxAuthToken,
-        }),
-      });
-
-      const result = (await response.json()) as {
-        success: boolean;
-        data?: { sandbox_id: string };
-        error?: string;
-      };
-
-      if (result.success) {
-        console.log(`[DO] Sandbox restored: ${result.data?.sandbox_id}`);
-        this.updateSandboxStatus("connecting");
-        this.broadcast({ type: "sandbox_status", status: "connecting" });
-        this.broadcast({
-          type: "sandbox_restored",
-          message: "Session restored from snapshot",
-        });
-      } else {
-        console.error("[DO] Restore from snapshot failed:", result.error);
-        this.updateSandboxStatus("failed");
-        this.broadcast({
-          type: "sandbox_error",
-          error: result.error || "Failed to restore from snapshot",
-        });
-      }
-    } catch (error) {
-      console.error("[DO] Restore from snapshot request failed:", error);
-      this.updateSandboxStatus("failed");
-      this.broadcast({
-        type: "sandbox_error",
-        error: error instanceof Error ? error.message : "Failed to restore sandbox",
-      });
-    }
+    await this.lifecycleManager.triggerSnapshot(reason);
   }
 
   /**
@@ -1335,27 +1117,12 @@ export class SessionDO extends DurableObject<Env> {
     return null;
   }
 
+  /**
+   * Warm sandbox proactively.
+   * Delegates to the lifecycle manager.
+   */
   private async warmSandbox(): Promise<void> {
-    const sandboxWs = this.getSandboxWebSocket();
-    if (sandboxWs) {
-      console.log("[DO] warmSandbox: sandbox already connected");
-      return;
-    }
-
-    if (this.isSpawningSandbox) {
-      console.log("[DO] warmSandbox: already spawning");
-      return;
-    }
-
-    const sandbox = this.getSandbox();
-    if (sandbox?.status === "spawning" || sandbox?.status === "connecting") {
-      console.log(`[DO] warmSandbox: sandbox status is ${sandbox.status}, skipping`);
-      return;
-    }
-
-    console.log("[DO] Warming sandbox proactively");
-    this.broadcast({ type: "sandbox_warming" });
-    await this.spawnSandbox();
+    await this.lifecycleManager.warmSandbox();
   }
 
   /**
@@ -1434,193 +1201,11 @@ export class SessionDO extends DurableObject<Env> {
   }
 
   /**
-   * Enforce circuit breaker for sandbox spawning.
-   * Blocks spawning after 3 failures within 5 minutes and broadcasts error to clients.
-   * Resets failure count if the circuit breaker window has passed.
-   *
-   * @returns true if spawning should proceed, false if blocked by circuit breaker
-   */
-  private enforceCircuitBreaker(spawnFailureCount: number, lastSpawnFailure: number): boolean {
-    const CIRCUIT_BREAKER_THRESHOLD = 3;
-    const CIRCUIT_BREAKER_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
-    const now = Date.now();
-    const timeSinceLastFailure = now - lastSpawnFailure;
-
-    if (
-      spawnFailureCount >= CIRCUIT_BREAKER_THRESHOLD &&
-      timeSinceLastFailure < CIRCUIT_BREAKER_WINDOW_MS
-    ) {
-      console.log(
-        `[DO] Circuit breaker open: ${spawnFailureCount} failures in last ${timeSinceLastFailure / 1000}s`
-      );
-      this.broadcast({
-        type: "sandbox_error",
-        error: `Sandbox spawning temporarily disabled after ${spawnFailureCount} failures. Try again in ${Math.ceil((CIRCUIT_BREAKER_WINDOW_MS - timeSinceLastFailure) / 1000)} seconds.`,
-      });
-      return false;
-    }
-
-    // Reset circuit breaker if window has passed
-    if (spawnFailureCount > 0 && timeSinceLastFailure >= CIRCUIT_BREAKER_WINDOW_MS) {
-      console.log("[DO] Circuit breaker window passed, resetting failure count");
-      this.repository.resetCircuitBreaker();
-    }
-
-    return true;
-  }
-
-  /**
    * Spawn a sandbox via Modal.
+   * Delegates to the lifecycle manager.
    */
   private async spawnSandbox(): Promise<void> {
-    // Check persisted status and last spawn time to prevent duplicate spawns
-    const sandboxState = this.repository.getSandboxWithCircuitBreaker();
-    const currentStatus = sandboxState?.status;
-    const lastSpawnTime = sandboxState?.created_at || 0;
-    const snapshotImageId = sandboxState?.snapshot_image_id;
-    const spawnFailureCount = sandboxState?.spawn_failure_count || 0;
-    const lastSpawnFailure = sandboxState?.last_spawn_failure || 0;
-    const now = Date.now();
-    const timeSinceLastSpawn = now - lastSpawnTime;
-
-    // Check circuit breaker
-    if (!this.enforceCircuitBreaker(spawnFailureCount, lastSpawnFailure)) {
-      return;
-    }
-
-    // Check if we have a snapshot to restore from
-    // This implements the Ramp spec: "restore to it later if the sandbox has exited and the user sends a follow up"
-    if (
-      snapshotImageId &&
-      (currentStatus === "stopped" || currentStatus === "stale" || currentStatus === "failed")
-    ) {
-      console.log(`[DO] Found snapshot ${snapshotImageId}, restoring instead of fresh spawn`);
-      await this.restoreFromSnapshot(snapshotImageId);
-      return;
-    }
-
-    // Don't spawn if already spawning or connecting (persisted check)
-    if (currentStatus === "spawning" || currentStatus === "connecting") {
-      console.log(`[DO] spawnSandbox: already ${currentStatus}, skipping`);
-      return;
-    }
-
-    // Don't spawn if status is "ready" and we have an active WebSocket
-    if (currentStatus === "ready") {
-      const existingSandboxWs = this.getSandboxWebSocket();
-      if (existingSandboxWs) {
-        console.log("[DO] spawnSandbox: sandbox ready with active WebSocket, skipping");
-        return;
-      }
-      // If no WebSocket but was recently spawned, wait for reconnect
-      if (timeSinceLastSpawn < 60000) {
-        console.log(
-          `[DO] spawnSandbox: status ready but no WebSocket, last spawn was ${timeSinceLastSpawn / 1000}s ago, waiting`
-        );
-        return;
-      }
-    }
-
-    // Cooldown: don't spawn if last spawn was within 30 seconds
-    if (timeSinceLastSpawn < 30000 && currentStatus !== "failed" && currentStatus !== "stopped") {
-      console.log(`[DO] spawnSandbox: last spawn was ${timeSinceLastSpawn / 1000}s ago, waiting`);
-      return;
-    }
-
-    // Also check in-memory flag for same-request protection
-    if (this.isSpawningSandbox) {
-      console.log("[DO] spawnSandbox: isSpawningSandbox=true, skipping");
-      return;
-    }
-    this.isSpawningSandbox = true;
-
-    try {
-      const session = this.getSession();
-      if (!session) {
-        console.error("Cannot spawn sandbox: no session");
-        return;
-      }
-
-      // Use the session_name for WebSocket routing (not the DO internal ID)
-      const sessionId = session.session_name || this.ctx.id.toString();
-      const sandboxAuthToken = generateId(); // Token for sandbox to authenticate
-
-      // Generate predictable sandbox ID BEFORE calling Modal
-      // This allows us to validate the connecting sandbox
-      const expectedSandboxId = `sandbox-${session.repo_owner}-${session.repo_name}-${now}`;
-
-      // Store status, auth token, AND expected sandbox ID BEFORE calling Modal
-      // This prevents race conditions where sandbox connects before we've stored expected ID
-      this.repository.updateSandboxForSpawn({
-        status: "spawning",
-        createdAt: now,
-        authToken: sandboxAuthToken,
-        modalSandboxId: expectedSandboxId,
-      });
-      this.broadcast({ type: "sandbox_status", status: "spawning" });
-      console.log(
-        `[DO] Creating sandbox via Modal API: ${session.session_name}, expectedId=${expectedSandboxId}`
-      );
-
-      // Get the control plane URL from env or construct it
-      const controlPlaneUrl =
-        this.env.WORKER_URL ||
-        `https://open-inspect-control-plane.${this.env.CF_ACCOUNT_ID || "workers"}.workers.dev`;
-
-      // Verify MODAL_API_SECRET and MODAL_WORKSPACE are configured
-      if (!this.env.MODAL_API_SECRET) {
-        throw new Error("MODAL_API_SECRET not configured");
-      }
-      if (!this.env.MODAL_WORKSPACE) {
-        throw new Error("MODAL_WORKSPACE not configured");
-      }
-
-      // Call Modal to create the sandbox with the expected ID
-      const modalClient = createModalClient(this.env.MODAL_API_SECRET, this.env.MODAL_WORKSPACE);
-      const { provider, model } = extractProviderAndModel(session.model || DEFAULT_MODEL);
-      const result = await modalClient.createSandbox({
-        sessionId,
-        sandboxId: expectedSandboxId, // Pass expected ID to Modal
-        repoOwner: session.repo_owner,
-        repoName: session.repo_name,
-        controlPlaneUrl,
-        sandboxAuthToken,
-        snapshotId: undefined, // Could use snapshot if available
-        gitUserName: undefined, // Could pass user info
-        gitUserEmail: undefined,
-        provider,
-        model,
-      });
-
-      console.log("Modal sandbox created:", result);
-
-      // Store Modal's internal object ID for snapshot API calls
-      if (result.modalObjectId) {
-        this.repository.updateSandboxModalObjectId(result.modalObjectId);
-        console.log(`[DO] Stored modal_object_id: ${result.modalObjectId}`);
-      }
-
-      this.updateSandboxStatus("connecting");
-      this.broadcast({ type: "sandbox_status", status: "connecting" });
-
-      // Reset circuit breaker on successful spawn initiation
-      this.repository.resetCircuitBreaker();
-    } catch (error) {
-      console.error("Failed to spawn sandbox:", error);
-
-      // Increment circuit breaker failure count
-      const failureNow = Date.now();
-      this.repository.incrementCircuitBreakerFailure(failureNow);
-      console.log("[DO] Incremented spawn failure count for circuit breaker");
-
-      this.updateSandboxStatus("failed");
-      this.broadcast({
-        type: "sandbox_error",
-        error: error instanceof Error ? error.message : "Failed to spawn sandbox",
-      });
-    } finally {
-      this.isSpawningSandbox = false;
-    }
+    await this.lifecycleManager.spawnSandbox();
   }
 
   /**
