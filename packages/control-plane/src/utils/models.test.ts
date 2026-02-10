@@ -37,6 +37,14 @@ describe("model utilities", () => {
       expect(isValidModel("openai/gpt-5.3-codex")).toBe(true);
     });
 
+    it("returns true for Gemini models", () => {
+      expect(isValidModel("gemini/gemini-3-flash")).toBe(true);
+    });
+
+    it("returns true for xAI models", () => {
+      expect(isValidModel("xai/grok-code-fast-1")).toBe(true);
+    });
+
     it("returns false for invalid models", () => {
       expect(isValidModel("gpt-4")).toBe(false);
       expect(isValidModel("claude-3-opus")).toBe(false);
@@ -99,6 +107,20 @@ describe("model utilities", () => {
       expect(extractProviderAndModel("openai/gpt-5.3-codex")).toEqual({
         provider: "openai",
         model: "gpt-5.3-codex",
+      });
+    });
+
+    it("extracts gemini provider from Gemini models", () => {
+      expect(extractProviderAndModel("gemini/gemini-3-flash")).toEqual({
+        provider: "gemini",
+        model: "gemini-3-flash",
+      });
+    });
+
+    it("extracts xai provider from xAI models", () => {
+      expect(extractProviderAndModel("xai/grok-code-fast-1")).toEqual({
+        provider: "xai",
+        model: "grok-code-fast-1",
       });
     });
 
@@ -211,6 +233,14 @@ describe("model utilities", () => {
       expect(supportsReasoning("openai/gpt-5.3-codex")).toBe(true);
     });
 
+    it("returns true for Gemini models with reasoning config", () => {
+      expect(supportsReasoning("gemini/gemini-3-flash")).toBe(true);
+    });
+
+    it("returns true for xAI models with reasoning config", () => {
+      expect(supportsReasoning("xai/grok-code-fast-1")).toBe(true);
+    });
+
     it("returns false for invalid models", () => {
       expect(supportsReasoning("gpt-4")).toBe(false);
       expect(supportsReasoning("invalid")).toBe(false);
@@ -234,6 +264,14 @@ describe("model utilities", () => {
     it("returns high for OpenAI codex models", () => {
       expect(getDefaultReasoningEffort("openai/gpt-5.2-codex")).toBe("high");
       expect(getDefaultReasoningEffort("openai/gpt-5.3-codex")).toBe("high");
+    });
+
+    it("returns medium for Gemini models", () => {
+      expect(getDefaultReasoningEffort("gemini/gemini-3-flash")).toBe("medium");
+    });
+
+    it("returns medium for xAI models", () => {
+      expect(getDefaultReasoningEffort("xai/grok-code-fast-1")).toBe("medium");
     });
 
     it("returns undefined for GPT 5.2 (no default)", () => {
@@ -268,6 +306,22 @@ describe("model utilities", () => {
       expect(config).toEqual({
         efforts: ["low", "medium", "high", "xhigh"],
         default: "high",
+      });
+    });
+
+    it("returns config for Gemini models", () => {
+      const config = getReasoningConfig("gemini/gemini-3-flash");
+      expect(config).toEqual({
+        efforts: ["low", "medium", "high"],
+        default: "medium",
+      });
+    });
+
+    it("returns config for xAI models", () => {
+      const config = getReasoningConfig("xai/grok-code-fast-1");
+      expect(config).toEqual({
+        efforts: ["low", "medium", "high"],
+        default: "medium",
       });
     });
 
@@ -321,6 +375,22 @@ describe("model utilities", () => {
       expect(isValidReasoningEffort("openai/gpt-5.2-codex", "none")).toBe(false);
     });
 
+    it("returns true for valid effort on Gemini models", () => {
+      expect(isValidReasoningEffort("gemini/gemini-3-flash", "low")).toBe(true);
+      expect(isValidReasoningEffort("gemini/gemini-3-flash", "medium")).toBe(true);
+      expect(isValidReasoningEffort("gemini/gemini-3-flash", "high")).toBe(true);
+      expect(isValidReasoningEffort("gemini/gemini-3-flash", "max")).toBe(false);
+      expect(isValidReasoningEffort("gemini/gemini-3-flash", "xhigh")).toBe(false);
+    });
+
+    it("returns true for valid effort on xAI models", () => {
+      expect(isValidReasoningEffort("xai/grok-code-fast-1", "low")).toBe(true);
+      expect(isValidReasoningEffort("xai/grok-code-fast-1", "medium")).toBe(true);
+      expect(isValidReasoningEffort("xai/grok-code-fast-1", "high")).toBe(true);
+      expect(isValidReasoningEffort("xai/grok-code-fast-1", "max")).toBe(false);
+      expect(isValidReasoningEffort("xai/grok-code-fast-1", "xhigh")).toBe(false);
+    });
+
     it("returns false for invalid models", () => {
       expect(isValidReasoningEffort("gpt-4", "high")).toBe(false);
       expect(isValidReasoningEffort("invalid", "max")).toBe(false);
@@ -348,6 +418,14 @@ describe("model utilities", () => {
       expect(normalizeModelId("openai/gpt-5.2")).toBe("openai/gpt-5.2");
       expect(normalizeModelId("openai/gpt-5.2-codex")).toBe("openai/gpt-5.2-codex");
       expect(normalizeModelId("openai/gpt-5.3-codex")).toBe("openai/gpt-5.3-codex");
+    });
+
+    it("passes through Gemini models unchanged", () => {
+      expect(normalizeModelId("gemini/gemini-3-flash")).toBe("gemini/gemini-3-flash");
+    });
+
+    it("passes through xAI models unchanged", () => {
+      expect(normalizeModelId("xai/grok-code-fast-1")).toBe("xai/grok-code-fast-1");
     });
 
     it("passes through unknown models without prefix", () => {

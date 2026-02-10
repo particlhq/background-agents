@@ -16,6 +16,8 @@ export const VALID_MODELS = [
   "openai/gpt-5.2",
   "openai/gpt-5.2-codex",
   "openai/gpt-5.3-codex",
+  "gemini/gemini-3-flash",
+  "xai/grok-code-fast-1",
 ] as const;
 
 export type ValidModel = (typeof VALID_MODELS)[number];
@@ -50,6 +52,8 @@ export const MODEL_REASONING_CONFIG: Partial<Record<ValidModel, ModelReasoningCo
   "openai/gpt-5.2": { efforts: ["none", "low", "medium", "high", "xhigh"], default: undefined },
   "openai/gpt-5.2-codex": { efforts: ["low", "medium", "high", "xhigh"], default: "high" },
   "openai/gpt-5.3-codex": { efforts: ["low", "medium", "high", "xhigh"], default: "high" },
+  "gemini/gemini-3-flash": { efforts: ["low", "medium", "high"], default: "medium" },
+  "xai/grok-code-fast-1": { efforts: ["low", "medium", "high"], default: "medium" },
 };
 
 export interface ModelDisplayInfo {
@@ -93,6 +97,18 @@ export const MODEL_OPTIONS: ModelCategory[] = [
       { id: "openai/gpt-5.2", name: "GPT 5.2", description: "400K context, fast" },
       { id: "openai/gpt-5.2-codex", name: "GPT 5.2 Codex", description: "Optimized for code" },
       { id: "openai/gpt-5.3-codex", name: "GPT 5.3 Codex", description: "Latest codex" },
+    ],
+  },
+  {
+    category: "Google",
+    models: [
+      { id: "gemini/gemini-3-flash", name: "Gemini 3 Flash", description: "Fast and efficient" },
+    ],
+  },
+  {
+    category: "xAI",
+    models: [
+      { id: "xai/grok-code-fast-1", name: "Grok Code Fast 1", description: "Fast code generation" },
     ],
   },
 ];
