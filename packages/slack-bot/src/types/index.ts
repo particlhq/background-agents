@@ -21,7 +21,6 @@ export interface Env {
 
   // Secrets
   SLACK_BOT_TOKEN: string;
-  SLACK_BOT_ID?: string; // Own bot ID - when set, only this bot's messages are ignored (other bots can invoke). When unset, ALL bot messages are ignored (safe default).
   SLACK_SIGNING_SECRET: string;
   SLACK_APP_TOKEN?: string;
   ANTHROPIC_API_KEY: string;
