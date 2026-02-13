@@ -21,6 +21,7 @@ export interface Env {
 
   // Secrets
   SLACK_BOT_TOKEN: string;
+  SLACK_BOT_ID?: string; // Own bot ID - only messages from this bot are ignored to prevent loops
   SLACK_SIGNING_SECRET: string;
   SLACK_APP_TOKEN?: string;
   ANTHROPIC_API_KEY: string;
