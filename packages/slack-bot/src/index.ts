@@ -764,9 +764,13 @@ async function handleSlackEvent(
 
   const event = payload.event;
 
-  // Ignore own messages to prevent loops, but allow other bots to invoke us
-  if (event.bot_id && event.bot_id === env.SLACK_BOT_ID) {
-    return;
+  // Ignore bot messages to prevent loops.
+  // If SLACK_BOT_ID is configured, only ignore our own messages (allows other bots to invoke us).
+  // If SLACK_BOT_ID is NOT configured, ignore ALL bot messages (safe default).
+  if (event.bot_id) {
+    if (!env.SLACK_BOT_ID || event.bot_id === env.SLACK_BOT_ID) {
+      return;
+    }
   }
 
   // Handle app_home_opened events
